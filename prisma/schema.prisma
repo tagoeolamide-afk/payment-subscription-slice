@@ -1,0 +1,317 @@
+// Fieldnote billing schema.
+// Money is always a whole number of minor units (kobo) in `amount_minor`, with its `currency`
+// alongside. The app uses the same representation (lib/money.ts); naira only exists at the
+// Flutterwave boundary and in display.
+//
+// Two logs, both append-only:
+//   payment_logs   - every stage of every payment attempt: initiated, verified, fulfilled, failed
+//   billing_events - subscription lifecycle: started, renewed, plan changes, cancel, resume, expiry
+
+generator client {
+  provider = "prisma-client"
+  output   = "../generated/prisma"
+}
+
+datasource db {
+  provider = "sqlite"
+}
+
+enum PlanId {
+  pro_monthly
+  pro_yearly
+}
+
+enum CheckoutStatus {
+  initiated
+  completed
+  failed
+}
+
+enum SubscriptionStatus {
+  active // renews at currentPeriodEnd
+  cancelled // no further charges; access until currentPeriodEnd
+  past_due // the renewal charge failed; no access until the customer pays again
+  expired // a cancelled subscription whose paid period ended
+  replaced // superseded by a newer subscription
+}
+
+/// Who charges renewals. Always `app` now: our billing run charges the saved card token.
+/// `provider_plan` (Flutterwave payment plans) is no longer supported; such a row gets no
+/// renewal and ends at its stored period end. The column stays so old data still loads.
+enum BillingMode {
+  app
+  provider_plan
+}
+
+enum PaymentKind {
+  initial // first payment, through hosted checkout
+  renewal // charged by the billing run with the saved card token
+  plan_change // mid-cycle switch to yearly: the prorated difference (see `proration`)
+}
+
+/// What a checkout pays for.
+enum CheckoutPurpose {
+  subscribe // first payment, or paying again after a lapse
+  plan_change // prorated mid-cycle switch to yearly, for a customer without a saved card
+}
+
+enum PaymentStatus {
+  succeeded
+  pending // accepted by Flutterwave, not settled yet; the billing run re-checks it
+  failed
+}
+
+/// One row per stage of a payment attempt (see PaymentLog).
+enum PaymentLogStage {
+  initiated // we created the checkout, or are about to charge the saved card
+  verified // we asked Flutterwave what happened; `result` holds the answer
+  fulfilled // we gave the customer what they paid for (Pro started or renewed)
+  failed // the attempt is over without payment; `result` holds the reason
+}
+
+/// Where the stage happened.
+enum PaymentLogSource {
+  checkout // the customer clicked Pay
+  return_page // Flutterwave sent the customer back
+  billing_run // renewal charges (scheduled job, or Test tools in development)
+  webhook // a verified Flutterwave webhook prompted a re-check
+}
+
+enum WebhookEventStatus {
+  received // signature verified and stored; not processed yet
+  processing // claimed by exactly one worker (see claimed_at); taken over if stuck > 5 min
+  processed // handled: we re-verified the payment with Flutterwave and acted on it
+  ignored // nothing to do (event type we don't handle, unknown or already settled tx_ref)
+  failed // processing threw; retried by the billing run
+}
+
+/// Subscription lifecycle only. Payment stages live in payment_logs.
+enum BillingEventType {
+  subscription_started
+  subscription_renewed
+  subscription_past_due
+  plan_change_scheduled
+  plan_change_cancelled
+  plan_changed
+  subscription_cancelled
+  cancellation_reason_given // answer to the optional prompt after cancelling
+  subscription_resumed
+  subscription_expired
+  test_clock_advanced
+}
+
+model User {
+  id            String         @id
+  name          String
+  email         String         @unique
+  createdAt     DateTime       @default(now()) @map("created_at")
+  checkouts     Checkout[]
+  subscriptions Subscription[]
+  payments      Payment[]
+  events        BillingEvent[]
+  paymentLogs   PaymentLog[]
+
+  @@map("users")
+}
+
+/// Every checkout attempt. tx_ref is our reference, sent to Flutterwave.
+model Checkout {
+  txRef             String         @id @map("tx_ref")
+  userId            String         @map("user_id")
+  user              User           @relation(fields: [userId], references: [id])
+  planId            PlanId         @map("plan_id")
+  amountMinor       Int            @map("amount_minor")
+  currency          String
+  flutterwavePlanId Int            @map("flutterwave_plan_id")
+  purpose           CheckoutPurpose @default(subscribe)
+  /// plan_change: the subscription being switched.
+  subscriptionId    Int?           @map("subscription_id")
+  /// plan_change: the proration breakdown as JSON (lib/proration.ts). `amount_minor` = its `due`.
+  proration         String?
+  status            CheckoutStatus @default(initiated)
+  createdAt         DateTime       @default(now()) @map("created_at")
+  completedAt       DateTime?      @map("completed_at")
+  subscription      Subscription?
+  payment           Payment?
+
+  @@index([userId, createdAt])
+  @@map("checkouts")
+}
+
+/// At most one active/cancelled subscription per user. Enforced by a partial
+/// unique index added by hand in the init migration (Prisma can't express it).
+model Subscription {
+  id                Int                @id @default(autoincrement())
+  userId            String             @map("user_id")
+  user              User               @relation(fields: [userId], references: [id])
+  planId             PlanId             @map("plan_id")
+  status             SubscriptionStatus
+  billingMode        BillingMode        @default(app) @map("billing_mode")
+  amountMinor        Int                @map("amount_minor")
+  currency           String
+  startedAt          DateTime           @map("started_at")
+  currentPeriodStart DateTime           @map("current_period_start")
+  currentPeriodEnd   DateTime           @map("current_period_end")
+  /// Plan to switch to at currentPeriodEnd (upgrade or downgrade). Same Pro features until then.
+  pendingPlanId      PlanId?            @map("pending_plan_id")
+  cancelledAt        DateTime?          @map("cancelled_at")
+  /// Answer to the optional prompt after cancelling (lib/cancellation.ts codes); null = not answered.
+  /// Cleared when the customer resumes; every answer is also a cancellation_reason_given event.
+  cancellationReason   String?          @map("cancellation_reason")
+  /// Optional free text with the reason, up to 500 characters.
+  cancellationNote     String?          @map("cancellation_note")
+  cancellationReasonAt DateTime?        @map("cancellation_reason_at")
+  flwSubscriptionId  Int?               @map("flw_subscription_id")
+  /// Flutterwave card token from the first payment; the billing run charges it.
+  cardToken          String?            @map("card_token")
+  /// Email Flutterwave recorded for the customer (token charges must use it).
+  customerEmail      String?            @map("customer_email")
+  cardBrand          String?            @map("card_brand")
+  cardLast4          String?            @map("card_last4")
+  /// Flutterwave payment_type of the paying transaction: card, bank_transfer, ussd, ... Only card saves a reusable token.
+  paymentMethod      String?            @map("payment_method")
+  /// The checkout that started this subscription.
+  txRef              String             @unique @map("tx_ref")
+  checkout          Checkout           @relation(fields: [txRef], references: [txRef])
+  createdAt         DateTime           @default(now()) @map("created_at")
+  updatedAt         DateTime           @updatedAt @map("updated_at")
+  payments          Payment[]
+
+  @@index([userId, status])
+  @@map("subscriptions")
+}
+
+/// Every charge attempt, verified with Flutterwave: first payments and renewals,
+/// successful or failed.
+model Payment {
+  id             Int           @id @default(autoincrement())
+  /// Our reference for this charge (sent to Flutterwave as tx_ref).
+  txRef          String        @unique @map("tx_ref")
+  /// Set for first payments: the hosted checkout this payment completed.
+  checkoutTxRef  String?       @unique @map("checkout_tx_ref")
+  checkout       Checkout?     @relation(fields: [checkoutTxRef], references: [txRef])
+  transactionId  Int?          @unique @map("transaction_id")
+  userId         String        @map("user_id")
+  user           User          @relation(fields: [userId], references: [id])
+  subscriptionId Int?          @map("subscription_id")
+  subscription   Subscription? @relation(fields: [subscriptionId], references: [id])
+  kind           PaymentKind   @default(initial)
+  status         PaymentStatus @default(succeeded)
+  planId         PlanId        @map("plan_id")
+  amountMinor    Int           @map("amount_minor")
+  currency       String
+  /// When the charge was attempted (paid or declined).
+  paidAt         DateTime      @map("paid_at")
+  failureReason  String?       @map("failure_reason")
+  cardBrand      String?       @map("card_brand")
+  cardLast4      String?       @map("card_last4")
+  /// Flutterwave payment_type of the paying transaction: card, bank_transfer, ussd, ... Only card saves a reusable token.
+  paymentMethod      String?        @map("payment_method")
+  /// plan_change: the proration breakdown as JSON (lib/proration.ts): credit, new price, due, days.
+  proration          String?
+
+  @@index([userId, paidAt])
+  @@map("payments")
+}
+
+/// Append-only log of everything that happens to a customer's billing.
+model BillingEvent {
+  id                    Int              @id @default(autoincrement())
+  userId                String           @map("user_id")
+  user                  User             @relation(fields: [userId], references: [id])
+  subscriptionId        Int?             @map("subscription_id")
+  type                  BillingEventType
+  planId                PlanId?          @map("plan_id")
+  amountMinor           Int?             @map("amount_minor")
+  currency              String?
+  txRef                 String?          @map("tx_ref")
+  providerTransactionId Int?             @map("provider_transaction_id")
+  /// Extra context as JSON text.
+  details               String?
+  occurredAt            DateTime         @default(now()) @map("occurred_at")
+
+  @@index([userId, occurredAt])
+  @@index([type])
+  @@map("billing_events")
+}
+
+/// Payment log: every stage of every payment attempt as its own row, never updated or deleted
+/// (except by the development reset). Rows for one attempt share `tx_ref`.
+///   result for `verified`:  successful | pending | failed | cancelled | not_found | amount_mismatch | provider_error
+///   result for `fulfilled`: active | pending_settlement (Pro renewed while Flutterwave settles the charge)
+///   result for `failed`:    the reason, e.g. card_declined, customer_cancelled, link_creation_failed
+/// "At most one `fulfilled` row per tx_ref" is a partial unique index in the migration SQL.
+model PaymentLog {
+  id                    Int              @id @default(autoincrement())
+  txRef                 String           @map("tx_ref")
+  userId                String           @map("user_id")
+  user                  User             @relation(fields: [userId], references: [id])
+  subscriptionId        Int?             @map("subscription_id")
+  kind                  PaymentKind
+  stage                 PaymentLogStage
+  source                PaymentLogSource
+  result                String?
+  planId                PlanId           @map("plan_id")
+  amountMinor           Int              @map("amount_minor")
+  currency              String
+  providerTransactionId Int?             @map("provider_transaction_id")
+  providerStatus        String?          @map("provider_status")
+  providerMessage       String?          @map("provider_message")
+  /// Extra context as JSON text.
+  details               String?
+  occurredAt            DateTime         @default(now()) @map("occurred_at")
+
+  @@index([txRef, occurredAt])
+  @@index([userId, occurredAt])
+  @@index([stage])
+  @@map("payment_logs")
+}
+
+/// Flutterwave webhooks. A row exists only for requests whose signature was verified;
+/// rejected requests are never stored. Idempotency is keyed on the provider reference:
+/// `event_key` = flutterwave:<event type>:<Flutterwave transaction id, else flw_ref>, unique.
+/// Any repeat for the same transaction (any status, any payload) only bumps `deliveries`.
+/// Processing is claimed exclusively (received/failed -> processing) so it runs once.
+/// The payload is never trusted: processing only uses its tx_ref to find our own record,
+/// then re-verifies the payment with Flutterwave.
+model WebhookEvent {
+  id              Int                @id @default(autoincrement())
+  eventKey        String             @unique @map("event_key")
+  eventType       String             @map("event_type")
+  /// Flutterwave's reference for the transaction: data.id, else data.flw_ref.
+  providerRef     String?            @map("provider_ref")
+  txRef           String?            @map("tx_ref")
+  /// How the signature was verified: `hmac` (flutterwave-signature) or `verif_hash`.
+  signatureMethod String             @map("signature_method")
+  /// Redacted: event type plus data.id, tx_ref, flw_ref, status, amount, currency, payment_type,
+  /// created_at. Card and customer details are never stored (lib/webhooks.ts › redactWebhookPayload).
+  payload         String
+  status          WebhookEventStatus @default(received)
+  result          String?
+  attempts        Int                @default(0)
+  /// How many times Flutterwave delivered this event (1 = no repeats).
+  deliveries      Int                @default(1)
+  receivedAt      DateTime           @default(now()) @map("received_at")
+  lastDeliveredAt DateTime           @default(now()) @map("last_delivered_at")
+  /// Set while a worker holds the claim; doubles as the claim token.
+  claimedAt       DateTime?          @map("claimed_at")
+  processedAt     DateTime?          @map("processed_at")
+
+  @@index([status, receivedAt])
+  @@index([txRef])
+  @@map("webhook_events")
+}
+
+/// Rate limiting (lib/rate-limit.ts): one row per allowed attempt, e.g. starting a checkout.
+/// Keys look like `checkout:user:<id>`, `checkout:ip:<address>`, `card_charge:user:<id>`.
+/// Written and read only with raw SQL, so "count in window, then insert" is one atomic statement.
+/// Rows older than the longest window (24h) are deleted as new ones arrive.
+model RateLimitHit {
+  id          Int    @id @default(autoincrement())
+  key         String
+  /// Unix time in milliseconds.
+  createdAtMs BigInt @map("created_at_ms")
+
+  @@index([key, createdAtMs])
+  @@map("rate_limit_hits")
+}

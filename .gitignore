@@ -1,0 +1,20 @@
+node_modules/
+.next/
+next-env.d.ts
+*.tsbuildinfo
+
+# secrets
+.env.local
+.env*.local
+
+# local data store
+data/
+
+# prisma
+generated/
+
+# trial fonts: licence required, not redistributed (see app/globals.css)
+public/fonts/*.otf
+
+# throwaway test scripts
+.e2e-tmp/
